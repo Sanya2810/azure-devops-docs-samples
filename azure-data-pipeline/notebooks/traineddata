@@ -1,0 +1,89 @@
+# Databricks notebook source
+dbutils.library.installPyPI("imblearn")
+import pickle
+import pandas as pd  
+import numpy as np 
+from sklearn.preprocessing import OrdinalEncoder
+import matplotlib.pyplot as plt  
+import seaborn as seabornInstance 
+from sklearn.model_selection import train_test_split 
+from sklearn import metrics
+from imblearn.over_sampling import SMOTE 
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_curve, roc_auc_score
+
+#dbutils.widgets.text("input", "","")
+#datafile = dbutils.widgets.get("input")
+datafile = "transformed.csv"
+storage_account_name = getArgument("storage_account_name")
+storage_container_name = getArgument("storage_container_name")
+
+mount_point = "/mnt/prepared"
+if not any(mount.mountPoint == mount_point for mount in dbutils.fs.mounts()): 
+  dbutils.fs.mount(
+    source = "wasbs://"+storage_container_name+"@"+storage_account_name+".blob.core.windows.net",
+    mount_point = mount_point,
+    extra_configs = {"fs.azure.account.key."+storage_account_name+".blob.core.windows.net":dbutils.secrets.get(scope = "testscope", key = "StorageKey")})
+
+dataset = pd.read_csv("/dbfs/"+mount_point+"/"+datafile) 
+features = ['transaction_id', 'category', 'amount(usd)', 'merchant', 'job','hour','age']
+X = dataset[features].set_index("transaction_id")
+y = dataset['is_fraud']
+
+# transforming the data categorical variables into ordinal encoder
+enc = OrdinalEncoder(dtype = np.int64)
+enc.fit(X.loc[:,['category','merchant','job']])
+X.loc[:, ['category','merchant','job']] = enc.transform(X[['category','merchant','job']])
+
+# train-test split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state = 42)
+
+# SMOTE
+sm = SMOTE(random_state=42)
+X_train_res, y_train_res = sm.fit_resample(X_train,y_train)
+
+### hyperparameter tuning
+# Number of trees in random forest
+n_estimators = [int(x) for x in np.linspace(start = 50, stop = 200, num = 4)]
+# Maximum number of levels in tree
+max_depth = [int(x) for x in np.linspace(10, 50, num = 5)]
+max_depth.append(None)
+# Minimum number of samples required to split a node
+min_samples_split = [2, 5, 10]
+# Minimum number of samples required at each leaf node
+min_samples_leaf = [1, 2, 4]
+
+# Create the random grid
+random_grid = {'n_estimators': n_estimators,
+               'max_depth': max_depth,
+               'min_samples_split': min_samples_split,
+               'min_samples_leaf': min_samples_leaf
+              }
+rf = RandomForestClassifier()
+rf_random = RandomizedSearchCV(estimator = rf,
+                               param_distributions = random_grid,
+                               cv = 5,
+                               verbose=2,
+                               random_state=42
+                              )
+
+#Fit and show the best parameters
+rf_fit = rf_random.fit(X_train_res, y_train_res)
+print(rf_fit.best_estimator_)
+
+## Model fitting using the best parameters
+rf_best = rf_fit.best_estimator_
+y_test_predict = rf_best.predict_proba(X_test)
+
+# calculate AUC
+auc = roc_auc_score(y_test, y_test_predict[:,1])
+print('AUC: %.3f' % auc)
+
+filepath_to_save = '/dbfs' + mount_point + '/randomforest.pkl'
+
+s = pickle.dump(rf_best, open(filepath_to_save, "wb"))
+
+
+# COMMAND ----------
+
